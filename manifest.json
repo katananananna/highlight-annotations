@@ -1,0 +1,9 @@
+{
+  "id": "highlight-annotations",
+  "name": "Highlight Annotations",
+  "version": "1.0.0",
+  "minAppVersion": "1.5.0",
+  "description": "Highlight any text in notes and attach several notes to each passage. Clean popover, sidebar and export.",
+  "author": "katananananna",
+  "isDesktopOnly": true
+}
