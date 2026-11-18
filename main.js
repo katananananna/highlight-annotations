@@ -5,7 +5,20 @@ const { Plugin, PluginSettingTab, Setting, Modal, Notice, MarkdownView, ItemView
 const { ViewPlugin, Decoration, WidgetType, hoverTooltip } = require('@codemirror/view');
 const { StateEffect } = require('@codemirror/state');
 
-const VERSION = '1.0.0';
+const VERSION = '1.0.1';
+const MAX_BACKUPS = 10;
+
+/** Remove old ==highlight== pairs and %%ha:…%% markers, but never inside code or math. */
+function stripOldMarkup(text) {
+  let fence = null;
+  return text.split('\n').map(line => {
+    const f = line.match(/^\s*(`{3,}|~{3,})/);
+    if (fence) { if (f && f[1][0] === fence[0] && f[1].length >= fence.length) fence = null; return line; }
+    if (f) { fence = f[1]; return line; }
+    return line.split(/(`[^`]*`|\$\$[^$]*\$\$|\$[^$\n]+\$)/).map((part, i) => (i % 2 ? part
+      : part.replace(/%%ha2?:[A-Za-z0-9+/=]+%%/g, '').replace(/==(?=\S)([^=\n]*?\S)==/g, '$1'))).join('');
+  }).join('\n');
+}
 const VIEW_TYPE = 'ha7-annotations';
 const MAX_SELECTION = 4000;
 const CONTEXT_CHARS = 48;
@@ -41,12 +54,23 @@ function locate(src, a) {
   let p = 0;
   while ((p = src.indexOf(a.text, p)) >= 0) { hits.push(p); p += a.text.length; }
   if (hits.length === 1) return hits[0];
+  if (!hits.length) return -1;
   const before = a.before || '', after = a.after || '';
   if (!before && !after) return -1;
-  const matches = hits.filter(h =>
-    src.slice(Math.max(0, h - before.length), h) === before &&
-    src.slice(h + a.text.length, h + a.text.length + after.length) === after);
-  return matches.length === 1 ? matches[0] : -1;
+  // Score each copy by how much of the saved context still matches around it,
+  // so a highlight survives edits to nearby text instead of becoming orphaned.
+  const score = h => {
+    let s = 0;
+    while (s < before.length && h - s - 1 >= 0 && src[h - s - 1] === before[before.length - s - 1]) s++;
+    let t = 0;
+    const end = h + a.text.length;
+    while (t < after.length && end + t < src.length && src[end + t] === after[t]) t++;
+    return s + t;
+  };
+  const scored = hits.map(h => ({ h, s: score(h) })).sort((x, y) => y.s - x.s);
+  if (scored[0].s === 0) return -1;
+  if (scored.length > 1 && scored[1].s === scored[0].s) return -1;
+  return scored[0].h;
 }
 
 function sanitizeNote(n) {
@@ -318,7 +342,22 @@ module.exports = class Annotations extends Plugin {
     }));
     this.registerEvent(this.app.workspace.on('editor-change', () => this.renderOutlineSoon()));
     this.registerEvent(this.app.vault.on('rename', (file, old) => {
-      if (this.data.notes[old]) this.change(d => { d.notes[file.path] = d.notes[old]; delete d.notes[old]; }).catch(() => {});
+      // Folder renames move every note underneath; keep annotations for all of them.
+      const moves = Object.keys(this.data.notes)
+        .filter(p => p === old || p.startsWith(old + '/'))
+        .map(p => [p, file.path + p.slice(old.length)]);
+      if (!moves.length) return;
+      this.change(d => {
+        for (const [from, to] of moves) {
+          // Merge rather than overwrite if the new path already has annotations.
+          d.notes[to] = [...(d.notes[to] || []), ...d.notes[from]];
+          delete d.notes[from];
+        }
+      }).catch(() => {});
+    }));
+    this.registerEvent(this.app.vault.on('delete', file => {
+      const gone = Object.keys(this.data.notes).filter(p => p === file.path || p.startsWith(file.path + '/'));
+      if (gone.length) this.change(d => { for (const p of gone) delete d.notes[p]; }).catch(() => {});
     }));
     this.app.workspace.onLayoutReady(() => { this.lastMd = this.app.workspace.getActiveViewOfType(MarkdownView); this.renderOutline(); });
   }
@@ -326,6 +365,7 @@ module.exports = class Annotations extends Plugin {
   onunload() {
     this.close('cancel');
     clearTimeout(this.outlineTimer);
+    clearTimeout(this.saveTimer);
     document.body.classList.remove('ha7-underline');
     document.body.style.removeProperty('--ha7-strength');
   }
@@ -441,7 +481,14 @@ module.exports = class Annotations extends Plugin {
     return task.catch(e => { console.error(e); new Notice('Could not save annotations. Your previous saved data was kept.'); throw e; });
   }
 
-  setting(k, v) { this.change(d => { d.settings[k] = v; }).catch(() => {}); }
+  setting(k, v) {
+    if (k !== 'strength') { this.change(d => { d.settings[k] = v; }).catch(() => {}); return; }
+    // Slider: update the look live, but write to disk only once the user stops dragging.
+    this.data.settings.strength = v;
+    this.applyLook();
+    clearTimeout(this.saveTimer);
+    this.saveTimer = setTimeout(() => this.change(d => { d.settings.strength = v; }).catch(() => {}), 400);
+  }
 
   /* ----- Popovers ----- */
 
@@ -804,18 +851,27 @@ module.exports = class Annotations extends Plugin {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (!view?.file) { new Notice('Open the affected note first.'); return; }
     const path = view.file.path, original = view.editor.getValue();
-    const clean = original.replace(/%%ha2?:[A-Za-z0-9+/=]+%%/g, '').replace(/==/g, '');
+    const clean = stripOldMarkup(original);
     const modal = new Modal(this.app);
     modal.onOpen = () => {
       el(modal.contentEl, 'h2', '', 'Review old highlight cleanup');
-      el(modal.contentEl, 'p', '', `Note: ${path}. This removes ALL native == delimiters and old plugin markers. Current annotations are kept. A full note-text backup is stored in plugin data before the edit.`);
-      el(modal.contentEl, 'p', '', `Characters removed: ${original.length - clean.length}. Nothing is changed until you confirm.`);
+      el(modal.contentEl, 'p', '', `Note: ${path}. This removes ==highlight== pairs and old plugin markers. Code blocks, inline code and math are left alone. Current annotations are kept. A full note-text backup is stored in plugin data before the edit (the last ${MAX_BACKUPS} are kept).`);
+      const changedLines = original.split('\n').map((l, i) => [l, clean.split('\n')[i]]).filter(([a, b]) => a !== b);
+      el(modal.contentEl, 'p', '', changedLines.length
+        ? `${changedLines.length} line(s) will change. Nothing is changed until you confirm.`
+        : 'Nothing to clean in this note.');
+      const preview = el(modal.contentEl, 'div', 'ha7-cleanup-preview');
+      preview.style.cssText = 'max-height:240px;overflow:auto;font-family:var(--font-monospace);font-size:var(--font-smaller);white-space:pre-wrap';
+      for (const [a, b] of changedLines.slice(0, 50)) {
+        el(preview, 'div', '', '− ' + a).style.color = 'var(--text-error)';
+        el(preview, 'div', '', '+ ' + b).style.color = 'var(--text-success)';
+      }
       const row = el(modal.contentEl, 'div', 'modal-button-container');
       const ok = el(row, 'button', 'mod-warning', 'Back up and clean this note');
       ok.addEventListener('click', async () => {
         if (view.file?.path !== path || view.editor.getValue() !== original) { new Notice('The note changed. Review again.'); return; }
         try {
-          await this.change(d => { d.backups.push({ path, text: original, created: Date.now() }); });
+          await this.change(d => { d.backups = [...d.backups, { path, text: original, created: Date.now() }].slice(-MAX_BACKUPS); });
           if (view.editor.getValue() !== original) { new Notice('Note changed during backup; no cleanup applied.'); return; }
           const last = view.editor.lastLine();
           view.editor.replaceRange(clean, { line: 0, ch: 0 }, { line: last, ch: view.editor.getLine(last).length });
