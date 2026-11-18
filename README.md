@@ -42,4 +42,4 @@ Earlier versions wrote `==highlight==` markup into notes. The command **Review o
 
 ## Licence
 
-No licence chosen yet. All rights reserved until one is added.
+MIT. See [LICENSE](LICENSE).
